@@ -1576,6 +1576,7 @@ enum ForwardCommands {
 async fn main() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
+    println!("KETI-Testbuild-001");
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
