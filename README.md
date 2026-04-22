@@ -37,7 +37,7 @@ OpenShell uses a k3s cluster inside a single Docker container — designed for s
 | Target | Single developer, 1 agent | **Multi-agent, GPU sharing** |
 | Data store | SQLite | **etcd (distributed)** |
 | Scalability | Single node | **Multi-node capable** |
-| GPU sharing | None | **HAMI Device Plugin** |
+| GPU sharing | None | **GPU Device Plugin** |
 | K8s API | 100% compatible | 100% compatible |
 
 ### Why k8s over k3s?
@@ -69,8 +69,8 @@ Layer 5: Inference routing (local vs cloud)
 
 ## Research Areas
 
-### 1. GPU Multi-Tenancy (HAMI)
-Exploring GPU resource partitioning for multi-agent environments using [HAMI](https://github.com/Project-HAMi/HAMi) — CUDA API hooking via LD_PRELOAD, Kubernetes Device Plugin integration, and time-window-based GPU utilization control. Enables multiple sandboxed agents to share GPU resources without interference.
+### 1. GPU Multi-Tenancy (LD_PreLoad)
+Exploring GPU resource partitioning for multi-agent environments using LD_PreLoad — CUDA API hooking via LD_PRELOAD, Kubernetes Device Plugin integration, and time-window-based GPU utilization control. Enables multiple sandboxed agents to share GPU resources without interference.
 
 ### 2. Smart Inference Routing
 Investigating intelligent model routing beyond simple local-vs-cloud decisions. Factoring in data sensitivity, task complexity, model cost, latency requirements, and available GPU resources to dynamically select the optimal inference backend.
@@ -98,7 +98,7 @@ Host (e.g., NVIDIA DGX Spark GB10)
             │
             ├── Gateway (StatefulSet)   — Control-plane API, sandbox lifecycle
             ├── Sandbox CRD Controller  — Agent sandbox orchestration
-            ├── HAMI Device Plugin      — GPU multi-tenancy (planned)
+            ├── GPU Device Plugin      — GPU multi-tenancy (planned)
             │
             └── Sandbox Pods × N        — Isolated agent environments
                  ├── Landlock LSM       — Kernel filesystem isolation
@@ -243,7 +243,7 @@ OrcaShell/
 | **NVIDIA OpenShell** | Base runtime (upstream) | [NVIDIA/OpenShell](https://github.com/NVIDIA/OpenShell) |
 | **NVIDIA NemoClaw** | OpenClaw blueprint for OpenShell | [NVIDIA/NemoClaw](https://github.com/NVIDIA/NemoClaw) |
 | **OpenClaw** | AI agent framework | [openclaw/openclaw](https://github.com/openclaw/openclaw) |
-| **HAMI** | GPU multi-tenancy Device Plugin | [Project-HAMi/HAMi](https://github.com/Project-HAMi/HAMi) |
+| **GPUPlugin** | GPU multi-tenancy Device Plugin |  |
 | **NVIDIA Dynamo** | Distributed inference serving | [ai-dynamo/dynamo](https://github.com/ai-dynamo/dynamo) |
 
 ---
