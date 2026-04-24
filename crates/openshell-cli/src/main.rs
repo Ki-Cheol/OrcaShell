@@ -815,6 +815,14 @@ enum GatewayCommands {
         /// (`--gpus all`) otherwise.
         #[arg(long)]
         gpu: bool,
+
+        /// Use kind (Kubernetes IN Docker) instead of the embedded k3s cluster.
+        ///
+        /// Requires `kind` and `helm` on PATH. The kind cluster is named
+        /// `orcashell-<name>` and managed directly by openshell.
+        /// Use ORCASHELL_KIND_CONFIG to override the kind config file path.
+        #[arg(long, env = "OPENSHELL_USE_KIND")]
+        use_kind: bool,
     },
 
     /// Stop the gateway (preserves state).
@@ -1620,6 +1628,7 @@ async fn main() -> Result<()> {
                 registry_username,
                 registry_token,
                 gpu,
+                use_kind,
             } => {
                 let gpu = if gpu {
                     vec!["auto".to_string()]
@@ -1638,6 +1647,7 @@ async fn main() -> Result<()> {
                     registry_username.as_deref(),
                     registry_token.as_deref(),
                     gpu,
+                    use_kind,
                 )
                 .await?;
             }

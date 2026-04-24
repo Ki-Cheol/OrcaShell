@@ -8,6 +8,7 @@ pub mod image;
 
 mod constants;
 mod docker;
+mod kind;
 mod metadata;
 mod mtls;
 mod paths;
@@ -22,7 +23,7 @@ mod runtime;
 pub(crate) static XDG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 use bollard::Docker;
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, WrapErr};
 use std::sync::{Arc, Mutex};
 
 use crate::constants::{
@@ -123,6 +124,9 @@ pub struct DeployOptions {
     /// When false, an existing gateway is left as-is and deployment is
     /// skipped (the caller is responsible for prompting the user first).
     pub recreate: bool,
+    /// When true, bootstrap uses kind (Kubernetes in Docker) instead of the
+    /// embedded k3s Docker container. Requires `kind` and `helm` on PATH.
+    pub use_kind: bool,
 }
 
 impl DeployOptions {
@@ -139,6 +143,7 @@ impl DeployOptions {
             registry_token: None,
             gpu: vec![],
             recreate: false,
+            use_kind: false,
         }
     }
 
@@ -208,6 +213,13 @@ impl DeployOptions {
         self.recreate = recreate;
         self
     }
+
+    /// Use kind (Kubernetes in Docker) instead of the embedded k3s cluster.
+    #[must_use]
+    pub fn with_use_kind(mut self, use_kind: bool) -> Self {
+        self.use_kind = use_kind;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +227,7 @@ pub struct GatewayHandle {
     name: String,
     metadata: GatewayMetadata,
     docker: Docker,
+    use_kind: bool,
 }
 
 impl GatewayHandle {
@@ -229,10 +242,17 @@ impl GatewayHandle {
     }
 
     pub async fn stop(&self) -> Result<()> {
+        if self.use_kind {
+            // kind clusters persist independently — stopping is a no-op
+            return Ok(());
+        }
         stop_container(&self.docker, &container_name(&self.name)).await
     }
 
     pub async fn destroy(&self) -> Result<()> {
+        if self.use_kind {
+            return kind::destroy_kind_cluster(&self.name);
+        }
         destroy_gateway_resources(&self.docker, &self.name).await
     }
 }
@@ -272,6 +292,7 @@ where
     let registry_token = options.registry_token;
     let gpu = options.gpu;
     let recreate = options.recreate;
+    let use_kind = options.use_kind;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
     // which needs a 'static callback for the bollard streaming pull.
@@ -283,6 +304,107 @@ where
             f(msg);
         }
     };
+
+    // --- kind cluster path -----------------------------------------------
+    // When use_kind=true we bypass the Docker/k3s container entirely and
+    // drive a kind cluster via `kind` and `helm` CLIs on the host.
+    if use_kind {
+        let kind_config_path = std::env::var("ORCASHELL_KIND_CONFIG").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            format!("{home}/workspace/OrcaShell/deploy/kind/kind-config.yaml")
+        });
+        let helm_chart_path = std::env::var("ORCASHELL_HELM_CHART").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            format!("{home}/workspace/OrcaShell/deploy/helm/openshell")
+        });
+
+        log("[status] Bootstrapping kind cluster".to_string());
+        kind::ensure_kind_cluster(&name, &kind_config_path)
+            .wrap_err("failed to create kind cluster")?;
+
+        // Compute extra SANs for kind (always local).
+        let kind_extra_sans: Vec<String> = {
+            let mut sans: Vec<String> = local_gateway_host().into_iter().collect();
+            if let Some(ref h) = gateway_host {
+                if !sans.contains(h) {
+                    sans.push(h.clone());
+                }
+            }
+            sans
+        };
+
+        // Load locally-built images into the kind cluster when requested.
+        if let Ok(push_images_str) = std::env::var("OPENSHELL_PUSH_IMAGES") {
+            for image in push_images_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                log(format!("[status] Loading image {image} into kind cluster"));
+                kind::kind_load_image(&name, image).wrap_err("failed to load image into kind")?;
+            }
+        }
+
+        // Create the namespace and secrets BEFORE deploying Helm so that when
+        // Helm creates the pod, all required volume secrets already exist.
+        log("[progress] Creating openshell namespace".to_string());
+        let ns_manifest = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "openshell" }
+        });
+        kind::kind_apply_manifest(&name, &ns_manifest.to_string())
+            .wrap_err("failed to create openshell namespace")?;
+
+        let workload_existed = kind::kind_workload_exists(&name);
+        let (pki_bundle, rotated) = reconcile_kind_pki(&name, &kind_extra_sans, &log).await?;
+        store_pki_bundle(&name, &pki_bundle)?;
+
+        reconcile_kind_ssh_handshake_secret(&name, &log)?;
+
+        log("[status] Deploying OpenShell gateway via Helm".to_string());
+        kind::deploy_helm_gateway(&name, &helm_chart_path, port, disable_tls, disable_gateway_auth)
+            .wrap_err("failed to deploy helm chart to kind cluster")?;
+
+        // If PKI was rotated and a workload was already running, restart it so
+        // the server picks up the new TLS secrets.
+        if rotated && workload_existed {
+            log("[progress] Restarting gateway to apply new TLS certificates".to_string());
+            tokio::task::spawn_blocking({
+                let n = name.clone();
+                move || kind::kind_restart_workload(&n, "statefulset/openshell")
+            })
+            .await
+            .into_diagnostic()??;
+        }
+
+        // Wait for the pod — all required secrets are already present.
+        kind::wait_for_kind_gateway_ready(&name, |msg| log(msg))
+            .wrap_err("gateway pod did not become ready")?;
+
+        let effective_host = gateway_host
+            .as_deref()
+            .unwrap_or("127.0.0.1")
+            .to_string();
+
+        let docker = Docker::connect_with_local_defaults()
+            .into_diagnostic()
+            .wrap_err("failed to connect to local Docker daemon")?;
+
+        let metadata = create_gateway_metadata_with_host(
+            &name,
+            None,
+            port,
+            Some(&effective_host),
+            disable_tls,
+        );
+        store_gateway_metadata(&name, &metadata)?;
+        save_active_gateway(&name)?;
+
+        return Ok(GatewayHandle {
+            name: name.clone(),
+            metadata,
+            docker,
+            use_kind: true,
+        });
+    }
+    // ---------------------------------------------------------------------
 
     // Create Docker client based on deployment mode.
     // For local deploys, run a preflight check to fail fast with actionable
@@ -574,6 +696,7 @@ where
             name,
             metadata,
             docker: target_docker,
+            use_kind: false,
         }),
         Err(deploy_err) => {
             if resume {
@@ -619,10 +742,14 @@ pub async fn gateway_handle(name: &str, remote: Option<&RemoteOptions>) -> Resul
     // with the default ports (the actual ports are only known at deploy time).
     let metadata = load_gateway_metadata(name)
         .unwrap_or_else(|_| create_gateway_metadata(name, remote, DEFAULT_GATEWAY_PORT));
+    // Auto-detect kind cluster so that stop/destroy use the right path.
+    let use_kind = remote.is_none()
+        && kind::kind_cluster_exists(&kind::kind_cluster_name(name));
     Ok(GatewayHandle {
         name: name.to_string(),
         metadata,
         docker,
+        use_kind,
     })
 }
 
@@ -1189,6 +1316,179 @@ async fn wait_for_namespace(
     }
 
     unreachable!()
+}
+
+/// PKI reconciliation for kind clusters.
+///
+/// Uses host `kubectl` (with kind kubeconfig) instead of `docker exec` into a k3s container.
+/// Logic mirrors `reconcile_pki()`: reuse existing secrets if valid, generate fresh if not.
+async fn reconcile_kind_pki<F>(
+    name: &str,
+    extra_sans: &[String],
+    log: &F,
+) -> Result<(pki::PkiBundle, bool)>
+where
+    F: Fn(String),
+{
+    log("[progress] Waiting for openshell namespace (kind)".to_string());
+    tokio::task::spawn_blocking({
+        let name = name.to_string();
+        move || kind::kind_wait_for_namespace(&name, "openshell", 120)
+    })
+    .await
+    .into_diagnostic()
+    .wrap_err("spawn_blocking failed")??;
+
+    // Try to reuse existing secrets.
+    let try_load = || {
+        use constants::{CLIENT_TLS_SECRET_NAME, SERVER_CLIENT_CA_SECRET_NAME, SERVER_TLS_SECRET_NAME};
+        let server_cert =
+            kind::kind_get_secret_key(name, SERVER_TLS_SECRET_NAME, "openshell", "tls.crt")?;
+        let server_key =
+            kind::kind_get_secret_key(name, SERVER_TLS_SECRET_NAME, "openshell", "tls.key")?;
+        let ca_cert =
+            kind::kind_get_secret_key(name, SERVER_CLIENT_CA_SECRET_NAME, "openshell", "ca.crt")?;
+        let client_cert =
+            kind::kind_get_secret_key(name, CLIENT_TLS_SECRET_NAME, "openshell", "tls.crt")?;
+        let client_key =
+            kind::kind_get_secret_key(name, CLIENT_TLS_SECRET_NAME, "openshell", "tls.key")?;
+        let client_ca =
+            kind::kind_get_secret_key(name, CLIENT_TLS_SECRET_NAME, "openshell", "ca.crt")?;
+        for (label, data) in [
+            ("server cert", &server_cert),
+            ("server key", &server_key),
+            ("CA cert", &ca_cert),
+            ("client cert", &client_cert),
+            ("client key", &client_key),
+            ("client CA", &client_ca),
+        ] {
+            if !data.contains("-----BEGIN ") {
+                return Err(format!("{label} is not valid PEM"));
+            }
+        }
+        Ok(pki::PkiBundle {
+            ca_cert_pem: ca_cert,
+            ca_key_pem: String::new(),
+            server_cert_pem: server_cert,
+            server_key_pem: server_key,
+            client_cert_pem: client_cert,
+            client_key_pem: client_key,
+        })
+    };
+
+    match try_load() {
+        Ok(bundle) => {
+            log("[progress] Reusing existing TLS certificates".to_string());
+            return Ok((bundle, false));
+        }
+        Err(reason) => {
+            log(format!(
+                "[progress] Cannot reuse existing TLS secrets ({reason}) — generating new PKI"
+            ));
+        }
+    }
+
+    log("[progress] Generating TLS certificates".to_string());
+    let bundle = generate_pki(extra_sans)?;
+
+    log("[progress] Applying TLS secrets to kind cluster".to_string());
+    create_kind_tls_secrets(name, &bundle)?;
+
+    Ok((bundle, true))
+}
+
+/// Reconcile the SSH handshake HMAC secret in a kind cluster using host kubectl.
+///
+/// No-op if the secret already exists. Otherwise generates a 32-byte hex secret
+/// and applies it. The secret lives in etcd so it survives cluster restarts.
+fn reconcile_kind_ssh_handshake_secret<F>(name: &str, log: &F) -> Result<()>
+where
+    F: Fn(String),
+{
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    match kind::kind_get_secret_key(name, SSH_HANDSHAKE_SECRET_NAME, "openshell", "secret") {
+        Ok(val) if !val.trim().is_empty() => {
+            log("[progress] Reusing existing SSH handshake secret".to_string());
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    log("[progress] Generating SSH handshake secret".to_string());
+
+    let mut secret_bytes = [0u8; 32];
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")
+            .into_diagnostic()
+            .wrap_err("failed to open /dev/urandom")?
+            .read_exact(&mut secret_bytes)
+            .into_diagnostic()
+            .wrap_err("failed to read random bytes")?;
+    }
+    let secret_hex = secret_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let manifest = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": { "name": SSH_HANDSHAKE_SECRET_NAME, "namespace": "openshell" },
+        "type": "Opaque",
+        "data": {
+            "secret": STANDARD.encode(&secret_hex)
+        }
+    });
+
+    kind::kind_apply_manifest(name, &manifest.to_string())
+        .wrap_err("failed to apply SSH handshake secret to kind cluster")
+}
+
+/// Apply TLS k8s Secrets to a kind cluster using host kubectl.
+fn create_kind_tls_secrets(name: &str, bundle: &pki::PkiBundle) -> Result<()> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use constants::{CLIENT_TLS_SECRET_NAME, SERVER_CLIENT_CA_SECRET_NAME, SERVER_TLS_SECRET_NAME};
+    use serde_json::json;
+
+    let server_tls = json!({
+        "apiVersion": "v1", "kind": "Secret",
+        "metadata": { "name": SERVER_TLS_SECRET_NAME, "namespace": "openshell" },
+        "type": "kubernetes.io/tls",
+        "data": {
+            "tls.crt": STANDARD.encode(&bundle.server_cert_pem),
+            "tls.key": STANDARD.encode(&bundle.server_key_pem)
+        }
+    });
+
+    let client_ca = json!({
+        "apiVersion": "v1", "kind": "Secret",
+        "metadata": { "name": SERVER_CLIENT_CA_SECRET_NAME, "namespace": "openshell" },
+        "type": "Opaque",
+        "data": {
+            "ca.crt": STANDARD.encode(&bundle.ca_cert_pem)
+        }
+    });
+
+    let client_tls = json!({
+        "apiVersion": "v1", "kind": "Secret",
+        "metadata": { "name": CLIENT_TLS_SECRET_NAME, "namespace": "openshell" },
+        "type": "Opaque",
+        "data": {
+            "tls.crt": STANDARD.encode(&bundle.client_cert_pem),
+            "tls.key": STANDARD.encode(&bundle.client_key_pem),
+            "ca.crt": STANDARD.encode(&bundle.ca_cert_pem)
+        }
+    });
+
+    for manifest in [&server_tls, &client_ca, &client_tls] {
+        kind::kind_apply_manifest(name, &manifest.to_string())
+            .wrap_err("failed to apply TLS secret to kind cluster")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

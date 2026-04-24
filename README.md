@@ -27,37 +27,58 @@ OrcaShell is a space to study, experiment with, and prototype solutions for thes
 
 ---
 
-## Key Difference from OpenShell: k3s to k8s (kind)
+## Key Difference from OpenShell: k3s → kind (k8s)
 
-OpenShell uses a k3s cluster inside a single Docker container — designed for single-player, single-developer mode. OrcaShell replaces this with **kind (Kubernetes in Docker)** to explore multi-agent, multi-tenant scenarios.
+OpenShell uses a k3s cluster inside a single Docker container — designed for single-player, single-developer mode. OrcaShell adds **kind (Kubernetes in Docker)** as an opt-in backend to explore multi-agent, multi-tenant, and GPU multi-tenancy scenarios.
 
 | | OpenShell (upstream) | OrcaShell (this fork) |
 |---|---|---|
-| Orchestrator | k3s (embedded in Docker) | **kind / k8s** |
+| Orchestrator | k3s (embedded in Docker) | k3s (default) or **kind / k8s** (`--use-kind`) |
 | Target | Single developer, 1 agent | **Multi-agent, GPU sharing** |
-| Data store | SQLite | **etcd (distributed)** |
-| Scalability | Single node | **Multi-node capable** |
-| GPU sharing | None | **GPU Device Plugin** |
+| Data store | SQLite | SQLite (k3s) / **etcd** (kind) |
+| Scalability | Single node | **Multi-node capable** (kind) |
+| GPU sharing | None | **GPU Device Plugin / HAMI** (kind) |
 | K8s API | 100% compatible | 100% compatible |
 
-### Why k8s over k3s?
+### Why kind over k3s for GPU research?
 
 OpenShell chose k3s for valid reasons — it runs as a single binary (~50MB), boots in seconds, and needs only 512MB RAM. For single-developer use, it is optimal.
 
-However, for multi-agent research at scale (100+ sandboxes), k3s has limitations:
+For GPU multi-tenancy research (HAMI, device plugins) on DGX Spark, k3s has practical limitations:
 
-- **SQLite** cannot handle concurrent writes from hundreds of sandboxes
-- **Single node** prevents GPU distribution across multiple machines
-- **No HA** — one container failure kills all sandboxes
+- **Embedded containerd** — NVIDIA Container Runtime cannot be easily configured inside the k3s Docker container; GPU device plugins cannot reach host `/dev/nvidia*`
+- **SQLite** — cannot handle concurrent writes at scale
+- **Non-standard distribution** — HAMI is developed and tested against upstream k8s
 
-kind provides full k8s (etcd, multi-node support, standard scheduler) while still running inside Docker. The OpenShell security layers (Landlock, seccomp, OPA proxy) work identically on both — they are kernel-level features independent of the orchestrator.
+kind runs standard upstream Kubernetes inside a Docker container. Because kind uses **privileged containers**, the NVIDIA runtime on the host is directly accessible inside the kind node — enabling GPU device plugins without complex nested configuration.
 
-### OpenShell 6-Layer Security (unchanged)
-
-OrcaShell preserves all OpenShell security layers. Only Layer 0 changes.
+### Security Tradeoff: k3s vs kind
 
 ```
-Layer 0: Container (k3s Pod → kind/k8s Pod)    <-- only this changes
+k3s (OpenShell default)           kind (OrcaShell --use-kind)
+─────────────────────────         ──────────────────────────────
+HOST                              HOST
+└── Docker container              └── Docker container ⚠ privileged
+    (non-privileged)                  └── k8s (upstream)
+    └── k3s                               └── Sandbox Pod
+        └── Sandbox Pod                       ├── GPU 사용 가능 ✓
+            ├── GPU 사용 불가 ✗               └── Host 커널 접근 가능 ⚠
+            └── Host 접근 불가 ✓
+
+보안 격리: 강함 ★★★★              보안 격리: 약함 ★★★
+GPU 멀티테넌시: 불가               GPU 멀티테넌시: 가능 (HAMI)
+```
+
+kind uses privileged Docker containers for its k8s nodes, meaning a pod that escapes the k8s level has broader host access than in the k3s path. The sandbox-level security layers (Landlock, seccomp, network policy) remain identical — the tradeoff is at the container infrastructure level.
+
+> **For research on DGX Spark**, this tradeoff is acceptable. For production deployments requiring maximum isolation, use the default k3s path.
+
+### OpenShell 6-Layer Security
+
+OrcaShell preserves all OpenShell security layers. Only Layer 0 changes when `--use-kind` is used.
+
+```
+Layer 0: Container (k3s Pod  or  kind/k8s Pod)  ← --use-kind で切替
 Layer 1: Network namespace + veth + OPA proxy
 Layer 2: Filesystem isolation (Landlock LSM)
 Layer 3: Syscall filtering (seccomp-bpf)
@@ -128,43 +149,67 @@ Key components (Rust crates):
 ### Prerequisites
 
 - Docker (running)
+- `kind` — [install](https://kind.sigs.k8s.io/docs/user/quick-start/#installation)
+- `kubectl` + `helm`
 - Linux host with kernel >= 5.13 (for Landlock LSM)
 - (Optional) NVIDIA GPU + drivers for GPU experiments
 
-### One-Click Deploy
+> **Linux inotify limits** — kind requires higher inotify limits than the kernel default. Apply once:
+> ```bash
+> sudo sysctl fs.inotify.max_user_watches=524288
+> sudo sysctl fs.inotify.max_user_instances=512
+> # Persist across reboots:
+> echo "fs.inotify.max_user_watches=524288" | sudo tee -a /etc/sysctl.conf
+> echo "fs.inotify.max_user_instances=512"  | sudo tee -a /etc/sysctl.conf
+> ```
+
+### Build
 
 ```bash
 git clone https://github.com/<your-username>/OrcaShell.git
 cd OrcaShell
-
-# Deploy kind cluster + OpenShell Gateway + Sandbox CRD
-chmod +x scripts/deploy-orcashell.sh
-./scripts/deploy-orcashell.sh
+cargo build -p openshell-cli
 ```
 
-This script automatically:
-1. Installs kind, kubectl, helm (if missing)
-2. Creates a kind cluster with GPU passthrough (if available)
-3. Generates TLS certificates
-4. Installs Sandbox CRD (agent-sandbox controller)
-5. Deploys OpenShell Gateway via Helm
-6. Verifies all components
-
-### Manual Steps
+### Start gateway (kind mode)
 
 ```bash
-# Create a test sandbox
-kubectl apply -f deploy/kind/test-sandbox.yaml
+# Start a kind-based gateway (creates kind cluster + deploys via Helm)
+./target/debug/openshell gateway start --use-kind --name my-gateway
 
-# Check status
-kubectl get sandbox -n openshell
-kubectl get pods -n openshell
+# Or use the environment variable (useful for NemoClaw integration)
+export OPENSHELL_USE_KIND=true
+./target/debug/openshell gateway start --name my-gateway
+```
 
-# Exec into sandbox
-kubectl exec -it test-sandbox -n openshell -- /bin/bash
+The bootstrap automatically:
+1. Creates a kind cluster (`orcashell-{name}`)
+2. Creates the `openshell` namespace
+3. Generates and applies mTLS PKI secrets
+4. Deploys the OpenShell Gateway via Helm
+5. Waits for the gateway pod to be ready
 
-# Destroy cluster
-./scripts/teardown-orcashell.sh
+### Create a sandbox
+
+```bash
+./target/debug/openshell sandbox create
+```
+
+### Destroy gateway
+
+```bash
+./target/debug/openshell gateway destroy --name my-gateway
+```
+
+### NemoClaw integration
+
+```bash
+# Install the built binary so NemoClaw finds it
+cp ./target/debug/openshell ~/.local/bin/openshell
+
+# Run NemoClaw with kind backend
+export OPENSHELL_USE_KIND=true
+nemoclaw onboard
 ```
 
 ---
@@ -227,12 +272,27 @@ OrcaShell/
 |-----------|---------|
 | Host | NVIDIA DGX Spark GB10 (aarch64, 128GB unified memory) |
 | OS | Ubuntu 24.04 |
-| Docker | 28.x |
-| Kubernetes | v1.35.1 (via kind v0.32.0) |
+| Kernel | 6.11.0-1016-nvidia |
+| Docker | 28.3.3 |
+| kind | v0.32.0 |
+| Kubernetes | v1.35.1 (via kind) |
 | Helm | v3.20.2 |
 | GPU | NVIDIA GB10 (nvidia-smi) |
 | LLM (tested) | Ollama / Qwen3:8b |
-| Agent (tested) | OpenClaw v2026.4.5 |
+| Agent (tested) | NemoClaw + OpenClaw v2026.4.5 |
+
+### Implementation: what changed from OpenShell
+
+The kind support is implemented as an opt-in path in `openshell-bootstrap`:
+
+| File | Change |
+|------|--------|
+| `crates/openshell-bootstrap/src/kind.rs` | New module: kind cluster lifecycle, kubectl helpers, secret management |
+| `crates/openshell-bootstrap/src/lib.rs` | `--use-kind` branch in `deploy_gateway_with_logs()`; kind-aware `GatewayHandle::destroy()` |
+| `crates/openshell-cli/src/main.rs` | `--use-kind` / `OPENSHELL_USE_KIND` flag on `gateway start` |
+| `deploy/kind/kind-config.yaml` | `extraPortMappings` (NodePort 30051 → host 8080) |
+
+The k3s Docker path is **unchanged** — `--use-kind` is fully opt-in.
 
 ---
 

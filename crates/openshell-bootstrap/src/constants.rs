@@ -5,6 +5,9 @@
 /// Used by in-container kubectl operations (node cleanup, PKI reconciliation, etc.).
 pub const KUBECONFIG_PATH: &str = "/etc/rancher/k3s/k3s.yaml";
 
+/// Kubeconfig path used when running in kind mode (host kubectl, not docker exec).
+pub const KIND_KUBECONFIG_PATH: &str = "~/.kube/config";
+
 /// K8s secret holding the server's TLS certificate and private key.
 pub const SERVER_TLS_SECRET_NAME: &str = "openshell-server-tls";
 /// K8s secret holding the CA certificate used to verify client certificates.

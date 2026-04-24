@@ -3,6 +3,10 @@ apiVersion: kind.x-k8s.io/v1alpha4
 name: orcashell
 nodes:
 - role: control-plane
+  extraPortMappings:
+  - containerPort: 30051
+    hostPort: 8080
+    protocol: TCP
   extraMounts:
   - hostPath: /dev/nvidia0
     containerPath: /dev/nvidia0
