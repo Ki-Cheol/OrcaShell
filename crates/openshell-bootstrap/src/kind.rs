@@ -227,6 +227,23 @@ pub fn kind_wait_for_namespace(
     }
 }
 
+/// Apply a k8s manifest from a file path via `kubectl apply -f <path>` in the kind cluster.
+pub fn kind_apply_yaml_file(gateway_name: &str, manifest_path: &str) -> Result<()> {
+    let cluster_name = kind_cluster_name(gateway_name);
+    let kubeconfig = kind_kubeconfig(&cluster_name);
+    let output = std::process::Command::new("kubectl")
+        .args(["apply", "-f", manifest_path])
+        .env("KUBECONFIG", &kubeconfig)
+        .output()
+        .into_diagnostic()
+        .wrap_err("failed to spawn kubectl apply")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette::miette!("kubectl apply -f {manifest_path} failed: {stderr}"));
+    }
+    Ok(())
+}
+
 /// Apply a k8s manifest (JSON string) via `kubectl apply -f -` in the kind cluster.
 pub fn kind_apply_manifest(gateway_name: &str, manifest_json: &str) -> Result<()> {
     let cluster_name = kind_cluster_name(gateway_name);

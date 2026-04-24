@@ -16,6 +16,7 @@ use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
 
 use crate::constants::container_name;
+use crate::kind;
 use crate::push::push_local_images;
 
 /// Build a container image from a Dockerfile and push it into the gateway.
@@ -46,12 +47,19 @@ pub async fn build_and_push_image(
     on_log(format!(
         "Pushing image {tag} into gateway \"{gateway_name}\""
     ));
-    let local_docker = Docker::connect_with_local_defaults()
-        .into_diagnostic()
-        .wrap_err("failed to connect to local Docker daemon")?;
-    let container = container_name(gateway_name);
-    let images: Vec<&str> = vec![tag];
-    push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
+    let kind_cluster = kind::kind_cluster_name(gateway_name);
+    if kind::kind_cluster_exists(&kind_cluster) {
+        // kind cluster: use `kind load docker-image` instead of docker exec into k3s container.
+        kind::kind_load_image(gateway_name, tag)
+            .wrap_err("failed to load image into kind cluster")?;
+    } else {
+        let local_docker = Docker::connect_with_local_defaults()
+            .into_diagnostic()
+            .wrap_err("failed to connect to local Docker daemon")?;
+        let container = container_name(gateway_name);
+        let images: Vec<&str> = vec![tag];
+        push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
+    }
 
     on_log(format!("Image {tag} is available in the gateway."));
     Ok(())

@@ -341,6 +341,26 @@ where
             }
         }
 
+        // Install the Sandbox CRD (agents.x-k8s.io/v1alpha1) and controller.
+        // This must happen before the gateway pod starts, as the gateway watches
+        // the Sandbox CRD on startup. The CRD manifest path can be overridden
+        // via ORCASHELL_AGENT_SANDBOX_MANIFEST.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let agent_sandbox_manifest = std::env::var("ORCASHELL_AGENT_SANDBOX_MANIFEST")
+            .unwrap_or_else(|_| {
+                format!("{home}/workspace/OrcaShell/deploy/kube/manifests/agent-sandbox.yaml")
+            });
+        if std::path::Path::new(&agent_sandbox_manifest).exists() {
+            log("[status] Installing Sandbox CRD (agents.x-k8s.io/v1alpha1)".to_string());
+            kind::kind_apply_yaml_file(&name, &agent_sandbox_manifest)
+                .wrap_err("failed to apply agent-sandbox CRD manifest")?;
+        } else {
+            tracing::warn!(
+                "agent-sandbox manifest not found at {agent_sandbox_manifest}; \
+                 set ORCASHELL_AGENT_SANDBOX_MANIFEST to override"
+            );
+        }
+
         // Create the namespace and secrets BEFORE deploying Helm so that when
         // Helm creates the pod, all required volume secrets already exist.
         log("[progress] Creating openshell namespace".to_string());

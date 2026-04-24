@@ -194,6 +194,17 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
+    // Compatibility: upstream gateway images inject OPENSHELL_SSH_SOCKET_PATH (old name).
+    // When that env var is set and --ssh-listen-addr was not explicitly given, fall back
+    // to the default TCP listen address so the SSH server still starts.
+    let ssh_listen_addr = args.ssh_listen_addr.or_else(|| {
+        if std::env::var("OPENSHELL_SSH_SOCKET_PATH").is_ok() {
+            Some("0.0.0.0:2222".to_string())
+        } else {
+            None
+        }
+    });
+
     // Get command - either from CLI args, environment variable, or default to /bin/bash
     let command = if !args.command.is_empty() {
         args.command
@@ -219,7 +230,7 @@ async fn main() -> Result<()> {
         args.openshell_endpoint,
         args.policy_rules,
         args.policy_data,
-        args.ssh_listen_addr,
+        ssh_listen_addr,
         args.ssh_handshake_secret,
         args.ssh_handshake_skew_secs,
         args.health_check,
