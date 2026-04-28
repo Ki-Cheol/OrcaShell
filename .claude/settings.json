@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kubectl get *)",
+      "Bash(kubectl logs *)",
+      "Bash(kubectl describe *)",
+      "Bash(KUBECONFIG=* kubectl get *)",
+      "Bash(KUBECONFIG=* kubectl logs *)",
+      "Bash(KUBECONFIG=* kubectl describe *)",
+      "Bash(kind get *)"
+    ]
+  }
+}

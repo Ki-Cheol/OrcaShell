@@ -255,13 +255,23 @@ fn verify_preface(
     nonce_cache: &NonceCache,
 ) -> Result<bool> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() != 5 || parts[0] != PREFACE_MAGIC {
-        return Ok(false);
-    }
-    let token = parts[1];
-    let timestamp: i64 = parts[2].parse().unwrap_or(0);
-    let nonce = parts[3];
-    let signature = parts[4];
+
+    // Accept both legacy 4-part format (no nonce, for older gateway images) and
+    // current 5-part format (with nonce for replay protection).
+    let (token, timestamp_str, nonce_opt, signature) = match parts.as_slice() {
+        [magic, token, timestamp, nonce, signature] if *magic == PREFACE_MAGIC => {
+            (*token, *timestamp, Some(*nonce), *signature)
+        }
+        [magic, token, timestamp, signature] if *magic == PREFACE_MAGIC => {
+            (*token, *timestamp, None, *signature)
+        }
+        _ => {
+            warn!(parts_count = parts.len(), raw_preface = %line, "NSSH1 preface format unrecognized");
+            return Ok(false);
+        }
+    };
+
+    let timestamp: i64 = timestamp_str.parse().unwrap_or(0);
 
     let now = i64::try_from(
         SystemTime::now()
@@ -275,46 +285,52 @@ fn verify_preface(
         return Ok(false);
     }
 
-    let payload = format!("{token}|{timestamp}|{nonce}");
+    let payload = if let Some(nonce) = nonce_opt {
+        format!("{token}|{timestamp}|{nonce}")
+    } else {
+        format!("{token}|{timestamp}")
+    };
     let expected = hmac_sha256(secret.as_bytes(), payload.as_bytes());
     if signature != expected {
         return Ok(false);
     }
 
-    // Reject replayed nonces. The cache is bounded by the reaper task which
-    // evicts entries older than `handshake_skew_secs`.
-    let mut cache = nonce_cache
-        .lock()
-        .map_err(|_| miette::miette!("nonce cache lock poisoned"))?;
-    if cache.contains_key(nonce) {
-        ocsf_emit!(
-            SshActivityBuilder::new(crate::ocsf_ctx())
-                .activity(ActivityId::Other)
-                .action(ActionId::Denied)
-                .disposition(DispositionId::Blocked)
-                .severity(SeverityId::High)
-                .auth_type(AuthTypeId::Other, "NSSH1")
-                .message(format!("NSSH1 nonce replay detected: {nonce}"))
-                .build()
-        );
-        ocsf_emit!(
-            DetectionFindingBuilder::new(crate::ocsf_ctx())
-                .activity(ActivityId::Open)
-                .action(ActionId::Denied)
-                .disposition(DispositionId::Blocked)
-                .severity(SeverityId::High)
-                .is_alert(true)
-                .confidence(ConfidenceId::High)
-                .finding_info(FindingInfo::new(
-                    "nssh1-nonce-replay",
-                    "NSSH1 Nonce Replay Attack"
-                ))
-                .evidence("nonce", nonce)
-                .build()
-        );
-        return Ok(false);
+    // Nonce replay protection: only enforced when the nonce field is present.
+    // Older gateway images that send the 4-part format are exempt.
+    if let Some(nonce) = nonce_opt {
+        let mut cache = nonce_cache
+            .lock()
+            .map_err(|_| miette::miette!("nonce cache lock poisoned"))?;
+        if cache.contains_key(nonce) {
+            ocsf_emit!(
+                SshActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::High)
+                    .auth_type(AuthTypeId::Other, "NSSH1")
+                    .message(format!("NSSH1 nonce replay detected: {nonce}"))
+                    .build()
+            );
+            ocsf_emit!(
+                DetectionFindingBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Open)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::High)
+                    .is_alert(true)
+                    .confidence(ConfidenceId::High)
+                    .finding_info(FindingInfo::new(
+                        "nssh1-nonce-replay",
+                        "NSSH1 Nonce Replay Attack"
+                    ))
+                    .evidence("nonce", nonce)
+                    .build()
+            );
+            return Ok(false);
+        }
+        cache.insert(nonce.to_string(), Instant::now());
     }
-    cache.insert(nonce.to_string(), Instant::now());
 
     Ok(true)
 }
@@ -1437,16 +1453,43 @@ mod tests {
         assert!(!verify_preface(&line, "wrong-secret", 300, &cache).unwrap());
     }
 
+    /// Build a legacy 4-part NSSH1 preface (no nonce, for older gateway compatibility).
+    fn build_preface_legacy(token: &str, secret: &str, timestamp: i64) -> String {
+        let payload = format!("{token}|{timestamp}");
+        let signature = hmac_sha256(secret.as_bytes(), payload.as_bytes());
+        format!("{PREFACE_MAGIC} {token} {timestamp} {signature}")
+    }
+
     #[test]
     fn verify_preface_rejects_malformed_input() {
         let cache = fresh_nonce_cache();
 
-        // Too few parts.
+        // Too few parts (3 — below both the 4-part and 5-part floor).
         assert!(!verify_preface("NSSH1 tok1 123", "s", 300, &cache).unwrap());
         // Wrong magic.
         assert!(!verify_preface("NSSH2 tok1 123 nonce sig", "s", 300, &cache).unwrap());
         // Empty string.
         assert!(!verify_preface("", "s", 300, &cache).unwrap());
+    }
+
+    #[test]
+    fn verify_preface_accepts_legacy_4part_format() {
+        let secret = "test-secret-key";
+        let ts = current_timestamp();
+        let line = build_preface_legacy("tok1", secret, ts);
+        let cache = fresh_nonce_cache();
+
+        assert!(verify_preface(&line, secret, 300, &cache).unwrap());
+    }
+
+    #[test]
+    fn verify_preface_rejects_legacy_with_wrong_hmac() {
+        let secret = "test-secret-key";
+        let ts = current_timestamp();
+        let line = build_preface_legacy("tok1", secret, ts);
+        let cache = fresh_nonce_cache();
+
+        assert!(!verify_preface(&line, "wrong-secret", 300, &cache).unwrap());
     }
 
     #[test]
